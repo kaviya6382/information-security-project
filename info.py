@@ -1,151 +1,126 @@
+"""Rock Paper Scissors player.
 
-from flask import Flask, request, jsonify, render_template
-import requests
-import hashlib
-import sqlite3
-import os
+Idea: every opponent bot is a deterministic function of *my* past plays (or of
+the clock), so I run a small simulation of each candidate behaviour, keep score
+of which one has been predicting the opponent correctly lately, and play the
+move that beats that model's prediction.
+"""
+import random
+from collections import deque
 
-app = Flask(__name__)
+BEAT = {"R": "P", "P": "S", "S": "R"}   # BEAT[x] is the move that beats x
+WINDOW = 20                              # how many recent rounds count for scoring
+MIN_RATE = 0.5                           # below this, nobody is predictable -> random
 
-DATABASE = "stocks.db"
 
-PROXY_URL = "https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock"
+class _AbbeyModel:
+    """Mirror of a bot that counts my 2-move sequences and counters my likely next move."""
 
-def connect_db():
-    return sqlite3.connect(DATABASE)
+    def __init__(self):
+        self.hist = []
+        self.order = {a + b: 0 for a in "RPS" for b in "RPS"}
 
-def initialize_db():
-    conn = connect_db()
-    cursor = conn.cursor()
+    def next_move(self, my_last):
+        prev = my_last or "R"
+        self.hist.append(prev)
+        last_two = "".join(self.hist[-2:])
+        if len(last_two) == 2:
+            self.order[last_two] += 1
+        sub = {k: self.order[k] for k in (prev + "R", prev + "P", prev + "S")}
+        predicted_me = max(sub, key=sub.get)[-1:]
+        return BEAT[predicted_me]
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS stocks (
-            symbol TEXT PRIMARY KEY,
-            likes INTEGER DEFAULT 0
-        )
-    """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_likes (
-            symbol TEXT,
-            ip_hash TEXT,
-            UNIQUE(symbol, ip_hash)
-        )
-    """)
+class _Match:
+    def __init__(self, carried_abbey=None):
+        self.me = []                 # my plays so far
+        self.opp = []                # opponent plays so far
+        self.preds = {}              # model name -> its prediction for the pending round
+        self.ctx_seen = None         # my last two plays when the pending round was predicted
+        self.ctx_counts = {}         # (my last two) -> {opp move: count}
+        self.freq = {"R": 0, "P": 0, "S": 0}
+        self.abbey = _AbbeyModel()
+        self.abbey_carry = carried_abbey or _AbbeyModel()   # abbey state can survive across matches
+        self.hits = {}
 
-    conn.commit()
-    conn.close()
+    # ---- learning from the opponent's last move -------------------------
+    def observe(self, opp_move):
+        self.opp.append(opp_move)
+        self.freq[opp_move] += 1
+        for name, pred in self.preds.items():
+            if pred is not None:
+                self.hits.setdefault(name, deque(maxlen=WINDOW)).append(int(pred == opp_move))
+        if self.ctx_seen is not None:
+            slot = self.ctx_counts.setdefault(self.ctx_seen, {"R": 0, "P": 0, "S": 0})
+            slot[opp_move] += 1
 
-def hash_ip(ip):
-    return hashlib.sha256(ip.encode()).hexdigest()
+    # ---- predictions of what the opponent will play next ----------------
+    def predict_all(self):
+        last = self.me[-1] if self.me else ""
+        ctx = tuple(self.me[-2:])
+        self.ctx_seen = ctx
 
-def get_stock_price(symbol):
-    url = f"{PROXY_URL}/{symbol}/quote"
+        # kris: plays whatever beats my previous move
+        kris = BEAT[last or "R"]
 
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
+        # mrugesh: counters my most frequent move among my last 10 (history starts with "")
+        last_ten = ([""] + self.me)[-10:]
+        most = max(set(last_ten), key=last_ten.count)
+        mrugesh = BEAT["S" if most == "" else most]
 
-    data = response.json()
+        # abbey: counts my 2-move sequences
+        abbey = self.abbey.next_move(last)
+        abbey_carry = self.abbey_carry.next_move(last)
 
-    return {
-        "stock": data.get("symbol", symbol),
-        "price": float(data.get("latestPrice", data.get("price")))
-    }
+        # quincy: repeats a cycle of length 5, so it equals what it did 5 rounds ago
+        cycle5 = self.opp[-5] if len(self.opp) >= 5 else None
 
-def add_like(symbol, ip_hash):
-    conn = connect_db()
-    cursor = conn.cursor()
+        # generic fallbacks
+        slot = self.ctx_counts.get(ctx)
+        ctx_pred = max(slot, key=slot.get) if slot and max(slot.values()) > 0 else None
+        freq = max(self.freq, key=self.freq.get) if self.opp else None
 
-    cursor.execute(
-        "INSERT OR IGNORE INTO stocks (symbol, likes) VALUES (?, 0)",
-        (symbol,)
-    )
+        self.preds = {
+            "cycle5": cycle5, "kris": kris, "mrugesh": mrugesh,
+            "abbey": abbey, "abbey_carry": abbey_carry,
+            "ctx": ctx_pred, "freq": freq,
+        }
 
-    cursor.execute("""
-        INSERT OR IGNORE INTO user_likes (symbol, ip_hash)
-        VALUES (?, ?)
-    """, (symbol, ip_hash))
+    def rate(self, name):
+        h = self.hits.get(name)
+        return (sum(h) + 1) / (len(h) + 2) if h else 0.5
 
-    if cursor.rowcount == 1:
-        cursor.execute("""
-            UPDATE stocks
-            SET likes = likes + 1
-            WHERE symbol = ?
-        """, (symbol,))
+    def best_model(self):
+        return max(self.preds, key=self.rate)
 
-    conn.commit()
-    conn.close()
 
-def get_likes(symbol):
-    conn = connect_db()
-    cursor = conn.cursor()
+_match = None
 
-    cursor.execute(
-        "SELECT likes FROM stocks WHERE symbol = ?",
-        (symbol,)
-    )
 
-    result = cursor.fetchone()
-    conn.close()
+def player(prev_play, opponent_history=[]):
+    global _match
 
-    return result[0] if result else 0
+    if prev_play == "" or _match is None:          # first game of a match -> reset
+        carried = None
+        if _match is not None:                     # an abbey-like bot keeps its counts between matches
+            for name in ("abbey", "abbey_carry"):
+                if _match.rate(name) > 0.9:
+                    carried = getattr(_match, name)
+                    break
+        _match = _Match(carried)
 
-@app.route("/")
-def home():
-    return render_template("index.html")
+    if prev_play:
+        opponent_history.append(prev_play)
+        _match.observe(prev_play)
 
-@app.route("/api/stock-prices", methods=["GET"])
-def stock_prices():
+    _match.predict_all()
+    best = _match.best_model()
+    pred = _match.preds[best]
 
-    stocks = request.args.getlist("stock")
-    like = request.args.get("like") == "true"
+    if pred is None or _match.rate(best) < MIN_RATE:
+        move = random.choice("RPS")
+    else:
+        move = BEAT[pred]
 
-    if len(stocks) not in (1, 2):
-        return jsonify({"error": "Provide one or two stocks"}), 400
-
-    stocks = [s.strip().upper() for s in stocks]
-
-    ip = request.remote_addr or "unknown"
-    ip_hash = hash_ip(ip)
-
-    results = []
-
-    try:
-        for symbol in stocks:
-
-            if not symbol:
-                return jsonify({"error": "Invalid stock symbol"}), 400
-
-            if like:
-                add_like(symbol, ip_hash)
-
-            quote = get_stock_price(symbol)
-
-            results.append({
-                "stock": quote["stock"],
-                "price": quote["price"],
-                "likes": get_likes(symbol)
-            })
-
-        if len(results) == 1:
-            return jsonify({"stockData": results[0]})
-
-        difference = results[0]["likes"] - results[1]["likes"]
-
-        stock_data = []
-
-        for index, stock in enumerate(results):
-            stock_data.append({
-                "stock": stock["stock"],
-                "price": stock["price"],
-                "rel_likes": difference if index == 0 else -difference
-            })
-
-        return jsonify({"stockData": stock_data})
-
-    except requests.RequestException:
-        return jsonify({"error": "Unable to retrieve stock prices"}), 502
-
-if __name__ == "__main__":
-    initialize_db()
-    app.run(debug=True, port=3000)
+    _match.me.append(move)
+    return move
